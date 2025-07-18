@@ -1,0 +1,119 @@
+---
+- name: Pipeline trigger alert
+  community.aws.sns:
+    msg: 'Image factory pipeline has started - monitor GitLab pipeline.'
+    subject: User initiated RASC Image pipeline
+    topic: asc-ami-generator-notification
+
+- name: Set user_data_script based on cuda
+  set_fact:
+    user_data_script: "{{ 'user_data_script.j2' if cuda == 'true' else 'non_cuda_user_data_script.j2' }}"
+  register: userdata
+
+- name: Set AMI Name with updated naming standards
+  set_fact:
+    image_name: >-
+      {% set timestamp = lookup('pipe', 'date +%m%d%y-%H%M%S') %}
+      {% if cuda == 'true' %}
+        Amg-ASC-Cuda-{{ cuda_version }}-{{ team_name }}-{{ timestamp }}
+      {% elif app_specific is defined and app_specific == 'true' %}
+        Amg-ASC-SC-APP-{{ os }}-{{ team_name }}-{{ timestamp }}
+      {% elif workstation is defined and workstation == 'true' %}
+        Amg-ASC-SC-WS-{{ os }}-{{ team_name }}-{{ timestamp }}
+      {% else %}
+        Amg-ASC-SC-{{ team_name }}-{{ timestamp }}
+      {% endif %}
+  register: imagename
+
+- name: Set bucket path for AMI backup
+  set_fact:
+    ami_path: "{{ 'cuda/' + cuda_version if cuda == 'true' else 'non-cuda' }}"
+
+- name: Debug user_data script being used
+  ansible.builtin.debug:
+    var: userdata
+
+- name: Launch EC2 instance
+  amazon.aws.ec2_instance:
+    name: "{{ instance_name }}-{{ os }}"
+    vpc_subnet_id: "{{ subnet_id }}"
+    instance_type: "{{ instance_type }}"
+    iam_instance_profile: "{{ iam_role_arn }}"
+    security_group: "{{ security_group_id }}"
+    region: "{{ region }}"
+    key_name: ami-generator
+    volumes:
+      - device_name: /dev/sda1
+        ebs:
+          volume_size: 50
+          delete_on_termination: true
+          kms_key_id: "{{ kms_key_id }}"
+          encrypted: true
+    user_data: "{{ lookup('template', user_data_script) }}"
+    image_id: "{{ base_ami_id }}"
+    tags:
+      Environment: Production
+      Owner: "{{ owner }}"
+      CostCenter: "{{ cost_center }}"
+  register: ec2_instance
+
+- name: Wait for user_data installation to complete
+  pause:
+    minutes: "{{ 20 if cuda == 'true' else 14 }}"
+
+- name: Create AMI from instance
+  amazon.aws.ec2_ami:
+    instance_id: "{{ ec2_instance.instance_ids[0] }}"
+    region: "{{ region }}"
+    wait: true
+    name: "{{ image_name }}"
+    tags:
+      Owner: "{{ owner }}"
+      CostCenter: "{{ cost_center }}"
+      Name: "{{ image_name }}"
+      Service: "{{ image_name }}"
+    wait_timeout: 5400
+  register: ami_creation_result
+
+- name: Pause for 1 minute to ensure AMI is available
+  pause:
+    minutes: 1
+
+- name: Terminate the EC2 instance after AMI creation
+  amazon.aws.ec2_instance:
+    state: absent
+    region: "{{ region }}"
+    instance_ids: "{{ ec2_instance.instance_ids[0] }}"
+    wait_timeout: 720
+
+- name: Lookup existing SSM parameter
+  set_fact:
+    ssm_parameter_value: "{{ lookup('amazon.aws.aws_ssm', '/hpc/ami_id/' + ami_path, region=region) }}"
+  ignore_errors: true
+
+- name: Store AMI backup in S3
+  shell: >
+    aws ec2 create-store-image-task --image-id {{ ami_creation_result.image_id }}
+    --bucket rasc-image-backup/{{ ami_path }}
+  ignore_errors: true
+
+- name: Update SSM parameter with new AMI ID
+  community.aws.ssm_parameter:
+    name: "/hpc/ami_id/{{ ami_path }}"
+    description: "hpc ami"
+    region: "{{ region }}"
+    value: "{{ ami_creation_result.image_id }}"
+    overwrite: true
+
+- name: Share AMI with AWS Organizations (Add actual Org ARNs)
+  shell: >
+    aws ec2 modify-image-attribute --image-id {{ ami_creation_result.image_id }}
+    --launch-permission \"Add=[{\\\"OrganizationArn\\\":\\\"arn:aws:organizations::123456789012:organization/o-exampleorgid\\\"}]\"
+    --region {{ region }}
+  ignore_errors: true
+
+- name: Pipeline successful alert
+  community.aws.sns:
+    msg: '{{ ami_creation_result }}'
+    subject: AMI Build completed
+    topic: asc-ami-generator-notification
