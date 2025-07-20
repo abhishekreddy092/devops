@@ -117,3 +117,20 @@
     msg: '{{ ami_creation_result }}'
     subject: AMI Build completed
     topic: asc-ami-generator-notification
+
+- name: Share AMI with 3 AWS Organizations (hardcoded)
+  shell: |
+    aws ec2 modify-image-attribute \
+      --image-id {{ ami_creation_result.image_id }} \
+      --launch-permission "Add=[\
+        {\"OrganizationArn\":\"arn:aws:organizations::111111111111:organization/o-org1\"},\
+        {\"OrganizationArn\":\"arn:aws:organizations::222222222222:organization/o-org2\"},\
+        {\"OrganizationArn\":\"arn:aws:organizations::333333333333:organization/o-org3\"}\
+      ]" \
+      --region {{ region }}
+  ignore_errors: true
+  register: ami_share_result
+
+- name: Debug AMI share result
+  debug:
+    var: ami_share_result.stdout
